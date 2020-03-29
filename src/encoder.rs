@@ -117,12 +117,9 @@ impl Encoder {
                 let plan = SourceBlockEncodingPlan::generate(symbol_count as u16);
                 cached_plan = Some(plan);
             }
-            block_encoders.push(SourceBlockEncoder::with_encoding_plan2(
-                i as u8,
-                &config,
-                &block,
-                cached_plan.as_ref().unwrap(),
-            ));
+            let mut block_encoder = SourceBlockEncoder::new2(i as u8, &config, &block);
+            block_encoder.calculate_intermediate_symbols(cached_plan.as_ref());
+            block_encoders.push(block_encoder);
         }
 
         Encoder {
@@ -180,8 +177,9 @@ impl SourceBlockEncodingPlan {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceBlockEncoder {
+    symbol_size: u16,
     source_block_id: u8,
-    source_symbols: Vec<Symbol>,
+    pub source_symbols: Vec<Symbol>,
     intermediate_symbols: Vec<Symbol>,
 }
 
@@ -233,55 +231,32 @@ impl SourceBlockEncoder {
         data: &[u8],
     ) -> SourceBlockEncoder {
         let source_symbols = SourceBlockEncoder::create_symbols(config, data);
-
-        let (intermediate_symbols, _) = gen_intermediate_symbols(
-            &source_symbols,
-            config.symbol_size() as usize,
-            SPARSE_MATRIX_THRESHOLD,
-        );
+        let intermediate_symbols = Vec::with_capacity(source_symbols.len());
+        let symbol_size = config.symbol_size() as u16;
 
         SourceBlockEncoder {
-            source_block_id,
-            source_symbols,
-            intermediate_symbols: intermediate_symbols.unwrap(),
-        }
-    }
-
-    #[deprecated(
-        since = "1.3.0",
-        note = "Use the with_encoding_plan2() function instead. In version 2.0, that function will replace this one"
-    )]
-    pub fn with_encoding_plan(
-        source_block_id: u8,
-        symbol_size: u16,
-        data: &[u8],
-        plan: &SourceBlockEncodingPlan,
-    ) -> SourceBlockEncoder {
-        let config = ObjectTransmissionInformation::new(0, symbol_size, 0, 1, 1);
-        SourceBlockEncoder::with_encoding_plan2(source_block_id, &config, data, plan)
-    }
-
-    // TODO: rename this to with_encoding_plan() in version 2.0
-    pub fn with_encoding_plan2(
-        source_block_id: u8,
-        config: &ObjectTransmissionInformation,
-        data: &[u8],
-        plan: &SourceBlockEncodingPlan,
-    ) -> SourceBlockEncoder {
-        let source_symbols = SourceBlockEncoder::create_symbols(config, data);
-        // TODO: this could be more lenient and support anything with the same extended symbol count
-        assert_eq!(source_symbols.len(), plan.source_symbol_count as usize);
-
-        let intermediate_symbols = gen_intermediate_symbols_with_plan(
-            &source_symbols,
-            config.symbol_size() as usize,
-            &plan.operations,
-        );
-
-        SourceBlockEncoder {
+            symbol_size,
             source_block_id,
             source_symbols,
             intermediate_symbols,
+        }
+    }
+
+    pub fn calculate_intermediate_symbols(&mut self, plan: Option<&SourceBlockEncodingPlan>) {
+        self.intermediate_symbols = match plan {
+            Some(p) => gen_intermediate_symbols_with_plan(
+                &self.source_symbols,
+                self.symbol_size as usize,
+                &p.operations,
+            ),
+            None => {
+                let (intermediate_symbols, _) = gen_intermediate_symbols(
+                    &self.source_symbols,
+                    self.symbol_size as usize,
+                    SPARSE_MATRIX_THRESHOLD,
+                );
+                intermediate_symbols.unwrap()
+            }
         }
     }
 
