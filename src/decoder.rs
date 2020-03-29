@@ -126,6 +126,7 @@ pub struct SourceBlockDecoder {
     received_esi: HashSet<u32>,
     decoded: bool,
     sparse_threshold: u32,
+    intermediate_symbols: Vec<Symbol>,
 }
 
 impl SourceBlockDecoder {
@@ -161,6 +162,7 @@ impl SourceBlockDecoder {
             received_esi,
             decoded: false,
             sparse_threshold: SPARSE_MATRIX_THRESHOLD,
+            intermediate_symbols: vec![],
         }
     }
 
@@ -196,46 +198,33 @@ impl SourceBlockDecoder {
         constraint_matrix: impl BinaryMatrix,
         hdpc_rows: DenseOctetMatrix,
         symbols: Vec<Symbol>,
-    ) -> Option<Vec<u8>> {
-        let intermediate_symbols = match fused_inverse_mul_symbols(
+    ) -> bool {
+        match fused_inverse_mul_symbols(
             constraint_matrix,
             hdpc_rows,
             symbols,
             self.source_block_symbols,
         ) {
-            (None, _) => return None,
-            (Some(s), _) => s,
+            (None, _) => return false,
+            (Some(s), _) => self.intermediate_symbols = s,
         };
 
-        let mut result = vec![0; self.symbol_size as usize * self.source_block_symbols as usize];
-        let lt_symbols = num_lt_symbols(self.source_block_symbols);
-        let pi_symbols = num_pi_symbols(self.source_block_symbols);
-        let sys_index = systematic_index(self.source_block_symbols);
-        let p1 = calculate_p1(self.source_block_symbols);
-        for i in 0..self.source_block_symbols as usize {
-            if let Some(ref symbol) = self.source_symbols[i] {
-                self.unpack_sub_blocks(&mut result, symbol, i);
-            } else {
-                let rebuilt = self.rebuild_source_symbol(
-                    &intermediate_symbols,
-                    i as u32,
-                    lt_symbols,
-                    pi_symbols,
-                    sys_index,
-                    p1,
-                );
-                self.unpack_sub_blocks(&mut result, &rebuilt, i);
-            }
-        }
-
         self.decoded = true;
-        return Some(result);
+        return true;
     }
 
     pub fn decode<T: IntoIterator<Item = EncodingPacket>>(
         &mut self,
         packets: T,
     ) -> Option<Vec<u8>> {
+        self.intermediate_decode(packets);
+        return self.get_decoded_symbols();
+    }
+
+    pub fn intermediate_decode<T: IntoIterator<Item = EncodingPacket>>(
+        &mut self,
+        packets: T,
+    ) -> bool {
         for packet in packets {
             assert_eq!(
                 self.source_block_id,
@@ -269,7 +258,7 @@ impl SourceBlockDecoder {
             }
 
             self.decoded = true;
-            return Some(result);
+            return true;
         }
 
         if self.received_esi.len() as u32 >= num_extended_symbols {
@@ -311,12 +300,67 @@ impl SourceBlockDecoder {
                 return self.try_pi_decode(constraint_matrix, hdpc, d);
             }
         }
+        false
+    }
+
+    // Get All symbols
+    pub fn get_decoded_symbols(&mut self) -> Option<Vec<u8>> {
+        if self.received_source_symbols == self.source_block_symbols {
+            // No decoding needed when we have all source symbols
+            let mut result =
+                vec![0; self.symbol_size as usize * self.source_block_symbols as usize];
+            for i in 0..self.source_block_symbols as usize {
+                if let Some(ref symbol) = self.source_symbols[i] {
+                    self.unpack_sub_blocks(&mut result, symbol, i);
+                }
+            }
+            return Some(result);
+        } else if self.decoded {
+            let mut result =
+                vec![0; self.symbol_size as usize * self.source_block_symbols as usize];
+            let lt_symbols = num_lt_symbols(self.source_block_symbols);
+            let pi_symbols = num_pi_symbols(self.source_block_symbols);
+            let sys_index = systematic_index(self.source_block_symbols);
+            let p1 = calculate_p1(self.source_block_symbols);
+            for i in 0..self.source_block_symbols as usize {
+                if let Some(ref symbol) = self.source_symbols[i] {
+                    self.unpack_sub_blocks(&mut result, symbol, i);
+                } else {
+                    let rebuilt =
+                        self.rebuild_source_symbol(i as u32, lt_symbols, pi_symbols, sys_index, p1);
+                    self.unpack_sub_blocks(&mut result, &rebuilt, i);
+                }
+            }
+            return Some(result);
+        }
+        None
+    }
+
+    // Get a single symbol
+    pub fn get_decoded_symbol(&mut self, symbol_id: u32) -> Option<Vec<u8>> {
+        if symbol_id >= self.source_block_symbols {
+            return None;
+        }
+        if self.decoded {
+            let mut result = vec![0; self.symbol_size as usize];
+            if let Some(ref symbol) = self.source_symbols[symbol_id as usize] {
+                self.unpack_sub_blocks(&mut result, symbol, 0);
+            } else {
+                let lt_symbols = num_lt_symbols(self.source_block_symbols);
+                let pi_symbols = num_pi_symbols(self.source_block_symbols);
+                let sys_index = systematic_index(self.source_block_symbols);
+                let p1 = calculate_p1(self.source_block_symbols);
+                let rebuilt =
+                    self.rebuild_source_symbol(symbol_id, lt_symbols, pi_symbols, sys_index, p1);
+                self.unpack_sub_blocks(&mut result, &rebuilt, 0);
+            }
+            return Some(result);
+        }
         None
     }
 
     fn rebuild_source_symbol(
         &self,
-        intermediate_symbols: &[Symbol],
         source_symbol_id: u32,
         lt_symbols: u32,
         pi_symbols: u32,
@@ -327,7 +371,7 @@ impl SourceBlockDecoder {
         let tuple = intermediate_tuple(source_symbol_id, lt_symbols, sys_index, p1);
 
         for i in enc_indices(tuple, lt_symbols, pi_symbols, p1) {
-            rebuilt += &intermediate_symbols[i];
+            rebuilt += &self.intermediate_symbols[i];
         }
         rebuilt
     }
@@ -468,7 +512,8 @@ mod codec_tests {
             }
 
             let config = ObjectTransmissionInformation::new(0, symbol_size as u16, 0, 1, 1);
-            let encoder = SourceBlockEncoder::new2(1, &config, &data);
+            let mut encoder = SourceBlockEncoder::new2(1, &config, &data);
+            encoder.calculate_intermediate_symbols(None);
 
             let mut decoder = SourceBlockDecoder::new2(1, &config, elements as u64);
             decoder.set_sparse_threshold(sparse_threshold);
@@ -548,11 +593,12 @@ mod codec_tests {
         }
 
         let config = ObjectTransmissionInformation::new(0, 8, 0, 1, 1);
-        let encoder = if pre_plan {
+        let mut encoder = SourceBlockEncoder::new2(1, &config, &data);
+        if pre_plan {
             let plan = SourceBlockEncodingPlan::generate(symbol_count as u16);
-            SourceBlockEncoder::with_encoding_plan2(1, &config, &data, &plan)
+            encoder.calculate_intermediate_symbols(Some(&plan));
         } else {
-            SourceBlockEncoder::new2(1, &config, &data)
+            encoder.calculate_intermediate_symbols(None);
         };
 
         let mut decoder = SourceBlockDecoder::new2(1, &config, elements as u64);
